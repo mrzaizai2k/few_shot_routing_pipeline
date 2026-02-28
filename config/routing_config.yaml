@@ -1,0 +1,11 @@
+dataset_name: Null
+sentence_model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+test_size: 0.25
+batch_size: 8
+num_epochs: 4
+push_to_hub: True
+huggingface_out_dir: mrzaizai2k/model_routing_voice
+text_col_name: text
+label_col_name: label
+local_data_path: data/voice_routing.csv
+model_output_path: models/
