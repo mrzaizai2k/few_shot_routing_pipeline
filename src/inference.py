@@ -1,12 +1,23 @@
-
 import sys
+import time
+
 sys.path.append("")
 
 from setfit import SetFitModel
 
-# Download from Hub
-model = SetFitModel.from_pretrained("models/0226_15_59_routing_model")
-# Run inference
+# -----------------------------
+# Timing: model loading
+# -----------------------------
+t0 = time.perf_counter()
+model = SetFitModel.from_pretrained(
+    "models/0226_15_59_routing_model",
+    device="cuda"
+)
+t_load = time.perf_counter() - t0
+
+# -----------------------------
+# Input texts
+# -----------------------------
 texts = [
     "Please open the trunk and play some music for me",
     "Vui lòng mở cốp xe",
@@ -33,12 +44,29 @@ texts = [
     "ソフト웨어の更新を確認して",
 ]
 
-# Predicted class (argmax)
+# -----------------------------
+# Timing: predict
+# -----------------------------
+t1 = time.perf_counter()
 preds = model.predict(texts)
+t_predict = time.perf_counter() - t1
 
-
+# -----------------------------
+# Timing: predict_proba
+# -----------------------------
+t2 = time.perf_counter()
 probs = model.predict_proba(texts)
+t_proba = time.perf_counter() - t2
 
+# -----------------------------
+# Output
+# -----------------------------
 print("Predictions:", preds)
-print("Probabilities:", probs)
 print("Probabilities shape:", probs.shape)
+
+print("\nTiming results:")
+print(f"Model load time      : {t_load:.4f} s")
+print(f"Predict time         : {t_predict:.4f} s")
+print(f"Predict_proba time   : {t_proba:.4f} s")
+print(f"Total inference time : {(t_predict + t_proba):.4f} s")
+print(f"Avg time / sentence  : {(t_predict + t_proba) / len(texts):.6f} s")
