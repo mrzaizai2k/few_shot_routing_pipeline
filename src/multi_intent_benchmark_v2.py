@@ -123,8 +123,24 @@ CONFIG = {
         "電話",
     ],
 
-    # ── Embedding model ───────────────────────────────────────────────────
-    "embedding_model": (
+    # ── CJK-aware split patterns (method 5) ──────────────────────────────
+    # Korean: split on verb-connective suffix 고 (e.g. 열고 → 열 | 고)
+    # The pattern keeps the verb stem by splitting AFTER the 고/서 ending.
+    # We insert a split boundary after verb-stem+고 sequences.
+    # Regex: look for a Hangul character followed by 고/서 then space or end.
+    "split_pattern_ko": (
+        r"(?<=고)\s+"          # after 고 + whitespace  (열고 음악)
+        r"|(?<=서)\s+"         # after 서 + whitespace  (해서 ...)
+        r"|(?<=고)(?=[가-힣])" # after 고 directly before next Hangul (no space)
+    ),
+
+    # Japanese: split on て-form connectives and Japanese comma
+    # 開けて音楽  →  開けて | 音楽
+    "split_pattern_jp": (
+        r"(?<=て)(?=[ぁ-ん\u30A0-\u30FF\u4E00-\u9FFF])"  # after て before CJK/kana
+        r"|(?<=して)(?=[ぁ-ん\u30A0-\u30FF\u4E00-\u9FFF])"
+        r"|[、，]"             # Japanese / fullwidth comma
+    ),
         "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     ),
 
@@ -227,6 +243,74 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     """Cosine similarity between two 1-D numpy arrays."""
     denom = np.linalg.norm(a) * np.linalg.norm(b)
     return float(np.dot(a, b) / denom) if denom > 0 else 0.0
+
+
+# %%
+# Unicode block ranges used for language detection
+_RE_HANGUL  = re.compile(r"[\uAC00-\uD7A3\u1100-\u11FF\u3130-\u318F]")
+_RE_HIRAGANA = re.compile(r"[\u3040-\u309F\u30A0-\u30FF]")
+
+
+def detect_lang(text: str) -> str:
+    """
+    Heuristic language detection based on Unicode character blocks.
+    Returns one of: 'ko', 'jp', 'other'.
+
+    Korean (Hangul) and Japanese (Hiragana / Katakana) are the two scripts
+    that need CJK-aware splitting; everything else falls through to the
+    standard regex split.
+
+    Detection is intentionally lightweight — a single character is enough
+    to identify the script.
+    """
+    if _RE_HANGUL.search(text):
+        return "ko"
+    if _RE_HIRAGANA.search(text):
+        return "jp"
+    return "other"
+
+
+# %%
+def split_cjk_aware(text: str, cfg: dict) -> list[str]:
+    """
+    Language-aware tokenisation for method 5.
+
+    For Korean and Japanese the standard split_basic often returns a single
+    fragment because those languages use verb-connective suffixes (고, て)
+    rather than standalone conjunction words.
+
+    Algorithm
+    ---------
+    1. Detect script (Korean / Japanese / other).
+    2a. Korean  : split on cfg["split_pattern_ko"]  (고/서 verb endings)
+                  then also split on the standard pattern (handles 그리고 etc.)
+    2b. Japanese: split on cfg["split_pattern_jp"]  (て-form + 、)
+                  then also split on the standard pattern (そして etc.)
+    2c. Other   : fall back to split_basic (unchanged behaviour).
+    3. Strip and drop empty fragments.
+
+    Note: CJK splits are applied *first*, then the standard pattern is applied
+    to each resulting fragment, so both levels of splitting cooperate.
+    """
+    lang = detect_lang(text)
+
+    if lang == "ko":
+        primary = cfg["split_pattern_ko"]
+    elif lang == "jp":
+        primary = cfg["split_pattern_jp"]
+    else:
+        return split_basic(text, cfg)
+
+    # Primary CJK split
+    rough_parts = [p.strip() for p in re.split(primary, text) if p.strip()]
+
+    # Secondary standard split on each rough fragment (catches 그리고, そして …)
+    final = []
+    for part in rough_parts:
+        sub = split_basic(part, cfg)
+        final.extend(sub)
+
+    return [p for p in final if p]
 
 # %% [markdown]
 # ## 6 · Load Embedding Model
@@ -402,6 +486,60 @@ def method4_verb_guard_merge(text: str, cfg: dict) -> list[str]:
             result[-1] += " " + fragment
         else:
             # Has verb (any length)  OR  long noun phrase  ->  own intent
+            result.append(fragment)
+
+    return result
+
+
+# %%
+def method5_cjk_verb_guard(text: str, cfg: dict) -> list[str]:
+    """
+    Method 5 — CJK-aware split + verb-guarded merge.
+
+    Root cause addressed
+    --------------------
+    Methods 1–4 all rely on split_basic which splits on standalone
+    conjunction words (그리고, そして, and, và …).  Korean and Japanese
+    instead express coordination through verb-connective suffixes:
+
+      Korean : 열고  (open-AND)   틀고  (play-AND)   걸고  (call-AND)
+      Japanese: 開けて (open-AND)  流して (play-AND)  案内して (navigate-AND)
+
+    These suffixes are glued directly to the verb stem with no space,
+    so the standard split pattern never fires and the whole sentence
+    stays as one fragment.
+
+    Algorithm
+    ---------
+    1. **CJK-aware split** via split_cjk_aware():
+       - Korean  → split after 고/서 verb endings + standard pattern
+       - Japanese → split after て-form connectives + 、 + standard pattern
+       - Other   → identical to split_basic (no regression on en/vi)
+    2. **Verb-guarded merge** (same logic as method 4):
+       - short AND no verb  →  merge into previous  (dangling object)
+       - has verb           →  keep as separate intent
+       - long AND no verb   →  keep as separate intent
+
+    This means en/vi behaviour is identical to method 4 (no regression),
+    while ko/jp now get correct multi-intent splitting.
+
+    Pros : fixes ko/jp without embeddings; fast; no regression on en/vi.
+    Cons : CJK split patterns may over-split in rare cases where 고/て
+           appears as a non-connective ending (e.g. inside a quoted name).
+    """
+    parts = split_cjk_aware(text, cfg)
+    if len(parts) <= 1:
+        return parts
+
+    result = [parts[0]]
+
+    for fragment in parts[1:]:
+        is_short          = len(fragment.split()) < cfg["min_words_merge"]
+        fragment_has_verb = has_verb(fragment, ALL_VERBS)
+
+        if is_short and not fragment_has_verb:
+            result[-1] += " " + fragment
+        else:
             result.append(fragment)
 
     return result
@@ -838,8 +976,8 @@ METHODS = [
     {"func": method2_semantic,        "name": "semantic"},
     {"func": method3_semantic_merge,  "name": "semantic+merge"},
     {"func": method4_verb_guard_merge,"name": "verb-guard-merge"},
+    {"func": method5_cjk_verb_guard,  "name": "cjk-verb-guard"},
     # ── add more entries here ──────────────────────────────────────────
-    # {"func": method5_llm, "name": "llm"},
 ]
 
 # %% [markdown]
@@ -943,10 +1081,35 @@ plot_per_class(result4, CONFIG)
 plot_per_lang(result4, CONFIG)
 
 # %% [markdown]
-# ## 16 · Final Comparison
+# ## 16 · Run: Method 5 — cjk-verb-guard
 
 # %%
-all_results = [result1, result2, result3, result4]
+result5 = run_benchmark(
+    func         = METHODS[4]["func"],
+    name         = METHODS[4]["name"],
+    cfg          = CONFIG,
+    messages     = messages,
+    ground_truth = no_actions,
+    langs        = languages,
+)
+
+# %%
+plot_single_result(result5, CONFIG)
+
+# %%
+plot_error_distribution(result5, CONFIG)
+
+# %%
+plot_per_class(result5, CONFIG)
+
+# %%
+plot_per_lang(result5, CONFIG)
+
+# %% [markdown]
+# ## 17 · Final Comparison
+
+# %%
+all_results = [result1, result2, result3, result4, result5]
 
 plot_comparison(all_results, CONFIG)
 
@@ -968,7 +1131,7 @@ summary_df = pd.DataFrame([
 summary_df
 
 # %% [markdown]
-# ## 17 · Sample-level Inspection
+# ## 18 · Sample-level Inspection
 #
 # Useful during development — inspect individual predictions for any method.
 
@@ -1014,7 +1177,7 @@ inspect_samples(result2, no_actions, messages, n=10, only_errors=True)
 
 # %% [markdown]
 # ---
-# ## 20 · Per-Language Accuracy — All Methods
+# ## 19 · Per-Language Accuracy — All Methods
 #
 # Cross-tabulation: rows = language, columns = method.
 # Makes it easy to spot which language is hardest for each method,
@@ -1080,7 +1243,7 @@ lang_table.style.apply(highlight_best, axis=1)
 
 # %% [markdown]
 # ---
-# ## 18 · Experiment A — `min_words_merge` sweep (methods 3 & 4)
+# ## 20 · Experiment A — `min_words_merge` sweep (methods 3 & 4)
 #
 # We vary `min_words_merge` from **2 → 6** (step 1) while keeping every
 # other config value fixed.  A fragment is merged into its predecessor only
@@ -1194,7 +1357,7 @@ exp_a_df.loc[
 
 # %% [markdown]
 # ---
-# ## 19 · Experiment B — `similarity_threshold` sweep (methods 2 & 3)
+# ## 21 · Experiment B — `similarity_threshold` sweep (methods 2 & 3)
 #
 # We vary `similarity_threshold` across **[0.7, 0.8, 0.9]** while keeping
 # every other config value fixed.
