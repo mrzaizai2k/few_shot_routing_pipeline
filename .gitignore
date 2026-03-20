@@ -4,3 +4,4 @@ models/
 checkpoints/
 *.pyc
 .vscode/
+*.csv
