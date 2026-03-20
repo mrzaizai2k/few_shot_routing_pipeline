@@ -11,6 +11,8 @@
 # | 2 | `semantic` | Regex split + embedding-based merge/dedup + pronoun resolution |
 # | 3 | `semantic+merge` | Method 2 + short-fragment merging |
 # | 4 | `verb-guard-merge` | Split → merge short fragments **only when they carry no verb** |
+# | 5 | `cjk-verb-guard` | CJK-aware split (고/て suffixes) + verb-guard merge |
+# | 6 | `spacy-pos` | CJK-aware split + spaCy POS tagger for verb detection (en/ko/jp); vi falls back to verb-list |
 #
 # **Metrics**:
 # - **Accuracy** — fraction of messages where predicted action count == ground truth
@@ -36,6 +38,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import spacy
 from sentence_transformers import SentenceTransformer
 
 # %% [markdown]
@@ -141,8 +144,25 @@ CONFIG = {
         r"|(?<=して)(?=[ぁ-ん\u30A0-\u30FF\u4E00-\u9FFF])"
         r"|[、，]"             # Japanese / fullwidth comma
     ),
+
+    # ── Embedding model ───────────────────────────────────────────────────
+    "embedding_model": (
         "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     ),
+
+    # ── spaCy models (method 6) ───────────────────────────────────────────
+    # Official models for en/ko/jp; vi falls back to verb-list (no official model).
+    # Install before running method 6:
+    #   pip install spacy
+    #   python -m spacy download en_core_web_sm
+    #   python -m spacy download ko_core_news_sm
+    #   pip install spacy[ja] && python -m spacy download ja_core_news_sm
+    "spacy_models": {
+        "en": "en_core_web_sm",
+        "ko": "ko_core_news_sm",
+        "jp": "ja_core_news_sm",
+        "vi": None,             # no official model → falls back to has_verb()
+    },
 
     # ── Semantic thresholds ───────────────────────────────────────────────
     # Cosine similarity above which two consecutive fragments are merged
@@ -246,6 +266,29 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
 
 
 # %%
+def spacy_has_verb(text: str, lang: str) -> bool:
+    """
+    Return True if *text* contains at least one VERB or AUX token according
+    to the spaCy POS tagger for *lang*.
+
+    Falls back to has_verb() (verb-list check) when:
+    - The spaCy model for *lang* was not loaded (OSError at load time)
+    - *lang* is "vi" (no official model)
+    - *lang* is not in SPACY_NLPS at all
+
+    Universal POS tags used:
+    - VERB  : main verbs  (열다, 開ける, open, mở)
+    - AUX   : auxiliaries (있다, する, will, đã)
+    """
+    nlp = SPACY_NLPS.get(lang)
+    if nlp is None:
+        # Graceful fallback — use the original verb-list method
+        return has_verb(text, ALL_VERBS)
+    doc = nlp(text)
+    return any(token.pos_ in ("VERB", "AUX") for token in doc)
+
+
+# %%
 # Unicode block ranges used for language detection
 _RE_HANGUL  = re.compile(r"[\uAC00-\uD7A3\u1100-\u11FF\u3130-\u318F]")
 _RE_HIRAGANA = re.compile(r"[\u3040-\u309F\u30A0-\u30FF]")
@@ -320,6 +363,47 @@ print("Loading embedding model …")
 _t = time.time()
 embed_model = SentenceTransformer(CONFIG["embedding_model"])
 print(f"Done in {time.time() - _t:.1f}s")
+
+# %% [markdown]
+# ## 6b · Load spaCy Models (method 6)
+#
+# We load one spaCy pipeline per language.  Each model is loaded **once** here
+# and stored in `SPACY_NLPS` so method 6 can reuse them without reloading.
+#
+# Vietnamese has no official spaCy model, so `SPACY_NLPS["vi"]` is `None`
+# and the method falls back to the existing `has_verb()` list check.
+#
+# **Install commands** (run once in your environment):
+# ```bash
+# pip install spacy
+# python -m spacy download en_core_web_sm
+# python -m spacy download ko_core_news_sm
+# pip install "spacy[ja]"
+# python -m spacy download ja_core_news_sm
+# ```
+
+# %%
+SPACY_NLPS: dict[str, object] = {}
+
+for _lang, _model_name in CONFIG["spacy_models"].items():
+    if _model_name is None:
+        SPACY_NLPS[_lang] = None
+        print(f"  [{_lang}] no spaCy model configured — will use verb-list fallback")
+        continue
+    try:
+        _t = time.time()
+        SPACY_NLPS[_lang] = spacy.load(
+            _model_name,
+            # Load only the tagger for speed — skip parser, NER, lemmatizer
+            disable=["parser", "ner", "lemmatizer", "attribute_ruler"],
+        )
+        print(f"  [{_lang}] loaded '{_model_name}' in {time.time() - _t:.1f}s")
+    except OSError:
+        SPACY_NLPS[_lang] = None
+        print(f"  [{_lang}] model '{_model_name}' not found — run: "
+              f"python -m spacy download {_model_name}")
+
+print("spaCy models ready.")
 
 # %% [markdown]
 # ## 7 · Parser Methods
@@ -536,6 +620,71 @@ def method5_cjk_verb_guard(text: str, cfg: dict) -> list[str]:
     for fragment in parts[1:]:
         is_short          = len(fragment.split()) < cfg["min_words_merge"]
         fragment_has_verb = has_verb(fragment, ALL_VERBS)
+
+        if is_short and not fragment_has_verb:
+            result[-1] += " " + fragment
+        else:
+            result.append(fragment)
+
+    return result
+
+
+# %%
+def method6_spacy_pos(text: str, cfg: dict) -> list[str]:
+    """
+    Method 6 — CJK-aware split + spaCy POS-based verb detection.
+
+    Problem with methods 1–5
+    ------------------------
+    All prior methods use a hand-crafted verb list to decide whether a
+    fragment carries an intent.  This works well for English and Vietnamese
+    but is brittle for Korean and Japanese because:
+
+    1. Korean / Japanese verbs are highly inflected — the same verb root
+       appears in dozens of surface forms (열다/열어/열고/열면/여세요 …).
+       A fixed list only covers a fraction of these forms.
+    2. Even where the list verb is present, the CJK split (method 5) may
+       produce fragments where the verb stem is still partially embedded.
+
+    spaCy solution
+    --------------
+    spaCy's trained POS taggers assign Universal POS tags to each token after
+    proper morphological segmentation:
+
+    - Korean  (ko_core_news_sm)  — rule-based tokenizer, trained tagger
+    - Japanese(ja_core_news_sm)  — SudachiPy tokenizer, trained tagger
+    - English (en_core_web_sm)   — standard tokenizer + tagger
+    - Vietnamese                 — no official model → falls back to has_verb()
+
+    Universal tags used: VERB (open, 열다, 開ける, mở) and AUX (있다, する).
+
+    Algorithm
+    ---------
+    1. Detect language via detect_lang().
+    2. Apply CJK-aware split (split_cjk_aware) for ko/jp, split_basic otherwise.
+    3. Walk fragments left-to-right:
+       a. Detect verbs using spacy_has_verb() — real POS tags for en/ko/jp,
+          verb-list fallback for vi.
+       b. short AND no verb  →  merge into previous  (dangling object)
+       c. has verb           →  keep as new intent
+       d. long  AND no verb  →  keep as new intent   (noun phrase)
+
+    Pros : handles inflected verb forms in ko/jp that the verb list misses;
+           no hand-crafted verb list required for en/ko/jp.
+    Cons : requires spaCy + language models installed; slower than methods 4–5
+           due to POS inference per fragment; vi still uses verb-list fallback.
+    """
+    lang  = detect_lang(text)
+    parts = split_cjk_aware(text, cfg)
+
+    if len(parts) <= 1:
+        return parts
+
+    result = [parts[0]]
+
+    for fragment in parts[1:]:
+        is_short          = len(fragment.split()) < cfg["min_words_merge"]
+        fragment_has_verb = spacy_has_verb(fragment, lang)
 
         if is_short and not fragment_has_verb:
             result[-1] += " " + fragment
@@ -977,6 +1126,7 @@ METHODS = [
     {"func": method3_semantic_merge,  "name": "semantic+merge"},
     {"func": method4_verb_guard_merge,"name": "verb-guard-merge"},
     {"func": method5_cjk_verb_guard,  "name": "cjk-verb-guard"},
+    {"func": method6_spacy_pos,       "name": "spacy-pos"},
     # ── add more entries here ──────────────────────────────────────────
 ]
 
@@ -1106,10 +1256,35 @@ plot_per_class(result5, CONFIG)
 plot_per_lang(result5, CONFIG)
 
 # %% [markdown]
-# ## 17 · Final Comparison
+# ## 17 · Run: Method 6 — spacy-pos
 
 # %%
-all_results = [result1, result2, result3, result4, result5]
+result6 = run_benchmark(
+    func         = METHODS[5]["func"],
+    name         = METHODS[5]["name"],
+    cfg          = CONFIG,
+    messages     = messages,
+    ground_truth = no_actions,
+    langs        = languages,
+)
+
+# %%
+plot_single_result(result6, CONFIG)
+
+# %%
+plot_error_distribution(result6, CONFIG)
+
+# %%
+plot_per_class(result6, CONFIG)
+
+# %%
+plot_per_lang(result6, CONFIG)
+
+# %% [markdown]
+# ## 18 · Final Comparison
+
+# %%
+all_results = [result1, result2, result3, result4, result5, result6]
 
 plot_comparison(all_results, CONFIG)
 
@@ -1131,7 +1306,7 @@ summary_df = pd.DataFrame([
 summary_df
 
 # %% [markdown]
-# ## 18 · Sample-level Inspection
+# ## 19 · Sample-level Inspection
 #
 # Useful during development — inspect individual predictions for any method.
 
@@ -1177,7 +1352,7 @@ inspect_samples(result2, no_actions, messages, n=10, only_errors=True)
 
 # %% [markdown]
 # ---
-# ## 19 · Per-Language Accuracy — All Methods
+# ## 20 · Per-Language Accuracy — All Methods
 #
 # Cross-tabulation: rows = language, columns = method.
 # Makes it easy to spot which language is hardest for each method,
@@ -1243,7 +1418,7 @@ lang_table.style.apply(highlight_best, axis=1)
 
 # %% [markdown]
 # ---
-# ## 20 · Experiment A — `min_words_merge` sweep (methods 3 & 4)
+# ## 21 · Experiment A — `min_words_merge` sweep (methods 3 & 4)
 #
 # We vary `min_words_merge` from **2 → 6** (step 1) while keeping every
 # other config value fixed.  A fragment is merged into its predecessor only
@@ -1357,7 +1532,7 @@ exp_a_df.loc[
 
 # %% [markdown]
 # ---
-# ## 21 · Experiment B — `similarity_threshold` sweep (methods 2 & 3)
+# ## 22 · Experiment B — `similarity_threshold` sweep (methods 2 & 3)
 #
 # We vary `similarity_threshold` across **[0.7, 0.8, 0.9]** while keeping
 # every other config value fixed.
