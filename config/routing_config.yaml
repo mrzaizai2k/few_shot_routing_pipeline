@@ -9,3 +9,157 @@ text_col_name: text
 label_col_name: label
 local_data_path: data/voice_routing.csv
 model_output_path: models/
+
+multi_intent:
+
+  # ── Split pattern ─────────────────────────────────────────────
+  split_pattern: >
+    ,|;| and | then | also | and then |
+    và | rồi | sau đó |
+    그리고 | 그리고 나서 | 그 다음 |
+    そして | それから | そのあと 
+
+
+  # ── Pronouns (trigger coreference resolution) ─────────────────
+  pronouns:
+    # English
+    - him
+    - her
+    - them
+    - it
+    - that
+    - this
+    - his
+    - their
+
+    # Vietnamese
+    - anh ấy
+    - cô ấy
+    - ông ấy
+    - bà ấy
+    - họ
+    - nó
+    - đó
+
+    # Korean
+    - 그
+    - 그녀
+    - 그들
+    - 그것
+
+    # Japanese
+    - 彼
+    - 彼女
+    - 彼ら
+    - それ
+
+
+  # ── Intent-bearing verbs (used to decide split vs merge) ──────
+  verbs_en:
+    - open
+    - close
+    - play
+    - stop
+    - pause
+    - tell
+    - show
+    - find
+    - navigate
+    - turn
+    - switch
+    - enable
+    - disable
+    - unlock
+    - lock
+    - check
+    - search
+    - call
+    - send
+    - read
+    - start
+    - launch
+    - increase
+    - decrease
+    - set
+    - change
+
+  verbs_vi:
+    - mở
+    - đóng
+    - bật
+    - tắt
+    - phát
+    - dừng
+    - kể
+    - nói
+    - tìm
+    - kiểm tra
+    - dẫn
+    - chỉ
+    - gọi
+    - nhắn
+    - tăng
+    - giảm
+
+  verbs_ko:
+    - 열
+    - 닫
+    - 켜
+    - 꺼
+    - 재생
+    - 멈춰
+    - 말
+    - 알려
+    - 찾
+    - 검색
+    - 안내
+    - 전화
+
+  verbs_jp:
+    - 開け
+    - 閉め
+    - 再生
+    - 停止
+    - 教え
+    - 探
+    - 案내
+    - 電話
+
+
+  # ── CJK-aware split patterns (method 5) ───────────────────────
+  # Korean splitting rules
+  split_pattern_ko: >
+    (?<=고)\s+|
+    (?<=서)\s+|
+    (?<=고)(?=[가-힣])
+
+
+  # Japanese splitting rules
+  split_pattern_jp: >
+    (?<=て)(?=[ぁ-ん\u30A0-\u30FF\u4E00-\u9FFF])|
+    (?<=して)(?=[ぁ-ん\u30A0-\u30FF\u4E00-\u9FFF])|
+    [、，]
+
+
+  # ── Japanese postpositions ending in て (method 7) ────────────
+  jp_postpositions:
+    - について
+    - にとって
+    - によって
+    - に対して
+    - に関して
+    - をもって
+    - において
+
+
+  # ── spaCy models (method 6) ───────────────────────────────────
+  spacy_models:
+    en: en_core_web_sm
+    ko: ko_core_news_sm
+    jp: ja_core_news_sm
+    vi: null   # no official model → fallback
+
+
+  # ── Semantic thresholds ───────────────────────────────────────
+  similarity_threshold: 0.8
+  min_words_merge: 5

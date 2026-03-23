@@ -4,13 +4,7 @@ import os
 import  torch
 import yaml
 import time 
-import shutil
-import re
-from natsort import natsorted
-from langchain_community.document_loaders import PyMuPDFLoader
-                  
-from typing import Optional
-from langchain_community.vectorstores import FAISS
+
 
 def timeit(func):
     def wrapper(*args, **kwargs):
